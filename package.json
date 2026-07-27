@@ -1,0 +1,11 @@
+{
+  "name": "jiotv-plus-cache-node",
+  "version": "4.5.0",
+  "description": "Boss Kobir's High Performance 24/7 JioTV Plus Cacher Node for Railway",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "author": "Boss Kobir",
+  "license": "ISC"
+}
