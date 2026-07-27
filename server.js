@@ -348,7 +348,16 @@ const server = http.createServer((req, res) => {
         const rewriteTemplateAttribute = (match, attributeName, relPath) => {
             if (relPath.startsWith('http')) return match;
             const absPath = relPath.startsWith('/') ? `${url.parse(sourceMpdUrl).protocol}//${url.parse(sourceMpdUrl).host}${relPath}` : `${mpdBaseUrl}/${relPath}`;
-            const proxiedUrl = `${selfBase}/dash_segment?url=${base64UrlEncode(absPath)}&amp;`;
+            
+            const dollarIndex = absPath.indexOf('$');
+            let proxiedUrl;
+            if (dollarIndex === -1) {
+                proxiedUrl = `${selfBase}/dash_segment?url=${base64UrlEncode(absPath)}&amp;`;
+            } else {
+                const basePath = absPath.substring(0, dollarIndex);
+                const templatePart = absPath.substring(dollarIndex);
+                proxiedUrl = `${selfBase}/dash_segment?base=${base64UrlEncode(basePath)}&amp;temp=${templatePart}&amp;`;
+            }
             return `${attributeName}="${proxiedUrl}"`;
         };
 
@@ -364,17 +373,19 @@ const server = http.createServer((req, res) => {
 
     // ─── ROUTE 2: DASH Segment Caching Proxy (/dash_segment?url=ENCODED_URL) ───
     if (pathname === '/dash_segment') {
-        const encodedUrl = parsedUrl.query.url;
-        if (!encodedUrl) {
-            res.writeHead(400, { 'Content-Type': 'text/plain' });
-            res.end('Missing segment URL');
-            return;
+        let targetSegmentUrl = '';
+        if (parsedUrl.query.base && parsedUrl.query.temp) {
+            targetSegmentUrl = base64UrlDecode(parsedUrl.query.base) + parsedUrl.query.temp;
+        } else {
+            const encodedUrl = parsedUrl.query.url;
+            if (encodedUrl) {
+                targetSegmentUrl = base64UrlDecode(encodedUrl);
+            }
         }
 
-        const targetSegmentUrl = base64UrlDecode(encodedUrl);
         if (!targetSegmentUrl || !targetSegmentUrl.startsWith('http')) {
             res.writeHead(400, { 'Content-Type': 'text/plain' });
-            res.end('Invalid segment URL');
+            res.end('Missing or invalid target segment URL');
             return;
         }
 
@@ -406,7 +417,7 @@ const server = http.createServer((req, res) => {
             headers: STREAM_HEADERS
         };
 
-        const cRes = client.request(options, (cRes) => {
+        const cReq = client.request(options, (cRes) => {
             if (cRes.statusCode !== 200) {
                 res.writeHead(cRes.statusCode, { 'Content-Type': 'text/plain' });
                 res.end(`Source CDN responded with status: ${cRes.statusCode}`);
