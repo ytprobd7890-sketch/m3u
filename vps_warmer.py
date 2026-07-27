@@ -14,7 +14,7 @@ from concurrent.futures import ThreadPoolExecutor
 # Configuration (JioTV Plus Dedicated Playlist)
 RAILWAY_PLAYLIST_URL = os.environ.get(
     "RAILWAY_PLAYLIST_URL", 
-    "https://github.com/ytprobd7890-sketch/m3u/raw/refs/heads/main/output/worldwide.m3u"
+    "https://raw.githubusercontent.com/ytprobd7890-sketch/m3u/refs/heads/main/output/jtvplusww.m3u"
 )
 MAX_CONCURRENT_THREADS = int(os.environ.get("MAX_CONCURRENT_THREADS", "50"))
 CHANNEL_WARM_TIMEOUT = int(os.environ.get("CHANNEL_WARM_TIMEOUT", "3"))
