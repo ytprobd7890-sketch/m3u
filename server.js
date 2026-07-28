@@ -198,58 +198,11 @@ function fetchUrl(targetUrl, headers = {}, redirectCount = 0) {
     });
 }
 
-// Active 24/7 Channel Segment Harvester Worker
-async function harvestChannelSegment(channelM3u8Url) {
-    try {
-        const parsedUrl = url.parse(channelM3u8Url, true);
-        const chId = parsedUrl.query.id || '0';
-
-        // Step 1: Fetch the manifest from source
-        const m3u8Res = await fetchUrl(channelM3u8Url);
-        if (m3u8Res.statusCode !== 200) return;
-
-        // Step 2: Parse to find the target segment URL (.ts or .dash)
-        const lines = m3u8Res.data.split('\n');
-        let segmentUrl = '';
-        for (let line of lines) {
-            line = line.trim();
-            if (line && line.startsWith('http')) {
-                segmentUrl = line;
-                break;
-            }
-        }
-
-        if (!segmentUrl) return;
-
-        // Extract metadata if available in query params
-        const parsedSeg = url.parse(segmentUrl, true);
-        const chName = parsedSeg.query.ch_name || 'Unknown';
-        const genre = parsedSeg.query.genre || 'General';
-        const rawTargetUrl = base64UrlDecode(parsedSeg.query.url);
-
-        if (!rawTargetUrl) return;
-
-        const isDashSegment = rawTargetUrl.endsWith('.dash') || rawTargetUrl.includes('.dash?');
-        const ext = isDashSegment ? 'dash' : 'ts';
-        const urlHash = crypto.createHash('md5').update(rawTargetUrl).digest('hex');
-        const cacheFilePath = path.join(CACHE_DIR, `${urlHash}.${ext}`);
-
-        // Check if segment is already cached
-        if (fs.existsSync(cacheFilePath)) {
-            cachedChannelsMap.set(chName, {
-                id: chId,
-                name: chName,
-                genre: genre,
-                last_cached_at: new Date().toLocaleString("en-US", { timeZone: "Asia/Dhaka" }),
-                timestamp: Date.now()
-            });
-            return; 
-        }
-
-        // Step 3: Fetch raw segment and write directly to 1TB local SSD
-        const parsedTarget = url.parse(rawTargetUrl);
+// Helper to download a target segment file to local cache SSD
+function downloadSegmentToCache(segUrl, cacheFilePath) {
+    return new Promise((resolve, reject) => {
+        const parsedTarget = url.parse(segUrl);
         const client = parsedTarget.protocol === 'https:' ? https : http;
-        
         const options = {
             hostname: parsedTarget.hostname,
             port: parsedTarget.port,
@@ -258,33 +211,157 @@ async function harvestChannelSegment(channelM3u8Url) {
             headers: STREAM_HEADERS
         };
 
-        await new Promise((resolve, reject) => {
-            const req = client.request(options, (res) => {
-                if (res.statusCode !== 200) {
-                    reject(new Error(`CDN status: ${res.statusCode}`));
-                    return;
-                }
-                const writer = fs.createWriteStream(cacheFilePath);
-                res.pipe(writer);
-                res.on('end', () => {
-                    writer.close();
-                    totalSegmentsCached24_7++;
-                    cachedChannelsMap.set(chName, {
-                        id: chId,
-                        name: chName,
-                        genre: genre,
-                        last_cached_at: new Date().toLocaleString("en-US", { timeZone: "Asia/Dhaka" }),
-                        timestamp: Date.now()
-                    });
-                    if (!cachedGenresMap[genre]) cachedGenresMap[genre] = 0;
-                    cachedGenresMap[genre]++;
-                    resolve();
-                });
-                res.on('error', reject);
+        const req = client.request(options, (res) => {
+            if (res.statusCode !== 200) {
+                reject(new Error(`CDN status: ${res.statusCode}`));
+                return;
+            }
+            const writer = fs.createWriteStream(cacheFilePath);
+            res.pipe(writer);
+            res.on('end', () => {
+                writer.close();
+                totalSegmentsCached24_7++;
+                resolve();
             });
-            req.on('error', reject);
-            req.end();
+            res.on('error', (err) => {
+                writer.close();
+                fs.unlink(cacheFilePath, () => {});
+                reject(err);
+            });
         });
+        req.on('error', reject);
+        req.end();
+    });
+}
+
+// Active 24/7 Channel Segment Harvester Worker (Fully parses DASH MPD & HLS M3U8!)
+async function harvestChannelSegment(channelUrl) {
+    try {
+        const parsedUrl = url.parse(channelUrl, true);
+        const chName = parsedUrl.query.ch_name || 'Unknown';
+        const genre = parsedUrl.query.genre || 'General';
+
+        // Fetch the channel's manifest (M3U8 or MPD)
+        const m3u8Res = await fetchUrl(channelUrl);
+        if (m3u8Res.statusCode !== 200) return;
+
+        const isDash = channelUrl.endsWith('.mpd') || channelUrl.includes('.mpd?');
+        const segmentUrls = [];
+
+        if (isDash) {
+            // --- Parse DASH MPD XML ---
+            const initMatch = m3u8Res.data.match(/initialization="([^"]+)"/);
+            const mediaMatch = m3u8Res.data.match(/media="([^"]+)"/);
+            const repMatch = m3u8Res.data.match(/<Representation\s+id="([^"]+)"/);
+            
+            if (mediaMatch) {
+                const mediaTemplate = mediaMatch[1];
+                const repId = repMatch ? repMatch[1] : "video=148000";
+                
+                // Helper to resolve template paths to absolute URLs
+                const getAbsPath = (relPath) => {
+                    if (relPath.startsWith('http')) return relPath;
+                    return relPath.startsWith('/') 
+                        ? `${parsedUrl.protocol}//${parsedUrl.host}${relPath}` 
+                        : `${channelUrl.substring(0, channelUrl.lastIndexOf('/') + 1)}${relPath}`;
+                };
+
+                const absMediaTemplate = getAbsPath(mediaTemplate);
+
+                // Parse XML timeline to find currently active segments
+                const sMatches = [...m3u8Res.data.matchAll(/<S\s+([^>]+)\/>/g)];
+                let currentTime = 0;
+                const computedTimes = [];
+
+                sMatches.forEach(match => {
+                    const attrStr = match[1];
+                    const tAttr = attrStr.match(/t="([0-9]+)"/);
+                    const dAttr = attrStr.match(/d="([0-9]+)"/);
+                    const rAttr = attrStr.match(/r="([0-9]+)"/);
+                    
+                    if (tAttr) {
+                        currentTime = parseInt(tAttr[1]);
+                    }
+                    
+                    const duration = dAttr ? parseInt(dAttr[1]) : 0;
+                    const repeat = rAttr ? parseInt(rAttr[1]) : 0;
+                    
+                    computedTimes.push(currentTime.toString());
+                    
+                    for (let r = 0; r < repeat; r++) {
+                        currentTime += duration;
+                        computedTimes.push(currentTime.toString());
+                    }
+                    
+                    currentTime += duration;
+                });
+
+                // Pre-warm the last 2 media segments of the active timeline
+                const timesToCache = computedTimes.slice(-2);
+                
+                if (initMatch) {
+                    const absInitTemplate = getAbsPath(initMatch[1]);
+                    segmentUrls.push(absInitTemplate.replace('$RepresentationID$', repId));
+                }
+
+                timesToCache.forEach(time => {
+                    segmentUrls.push(absMediaTemplate.replace('$RepresentationID$', repId).replace('$Time$', time));
+                });
+            }
+        } else {
+            // --- Parse HLS M3U8 ---
+            const lines = m3u8Res.data.split('\n');
+            for (let line of lines) {
+                line = line.trim();
+                if (line && !line.startsWith('#')) {
+                    let absoluteSegUrl = "";
+                    if (line.startsWith('http')) {
+                        absoluteSegUrl = line;
+                    } else {
+                        const baseUrl = channelUrl.substring(0, channelUrl.lastIndexOf('/') + 1);
+                        absoluteSegUrl = line.startsWith('/') 
+                            ? `${parsedUrl.protocol}//${parsedUrl.host}${line}` 
+                            : `${baseUrl}${line}`;
+                    }
+                    segmentUrls.push(absoluteSegUrl);
+                    break; // Just cache the first active HLS segment
+                }
+            }
+        }
+
+        // --- Fetch and cache the extracted segments ---
+        for (const segUrl of segmentUrls) {
+            const urlHash = crypto.createHash('md5').update(segUrl).digest('hex');
+            const ext = segUrl.endsWith('.dash') || segUrl.includes('.dash?') ? 'dash' : 'ts';
+            const cacheFilePath = path.join(CACHE_DIR, `${urlHash}.${ext}`);
+
+            if (fs.existsSync(cacheFilePath)) {
+                // Already cached! Just update stats in memory
+                cachedChannelsMap.set(chName, {
+                    id: parsedUrl.pathname.replace('/jtv-plus/jtv.php/', ''),
+                    name: chName,
+                    genre: genre,
+                    last_cached_at: new Date().toLocaleString("en-US", { timeZone: "Asia/Dhaka" }),
+                    timestamp: Date.now()
+                });
+                continue;
+            }
+
+            try {
+                await downloadSegmentToCache(segUrl, cacheFilePath);
+                cachedChannelsMap.set(chName, {
+                    id: parsedUrl.pathname.replace('/jtv-plus/jtv.php/', ''),
+                    name: chName,
+                    genre: genre,
+                    last_cached_at: new Date().toLocaleString("en-US", { timeZone: "Asia/Dhaka" }),
+                    timestamp: Date.now()
+                });
+                if (!cachedGenresMap[genre]) cachedGenresMap[genre] = 0;
+                cachedGenresMap[genre]++;
+            } catch (err) {
+                // Fail silently
+            }
+        }
 
     } catch (e) {
         // Fail silently
@@ -332,7 +409,9 @@ async function runActiveHarvesterLoop() {
             if (!isBanned) {
                 const isAllowed247 = ALLOWED_247.some(allowedName => lastChName.toLowerCase().includes(allowedName.toLowerCase()));
                 if (isAllowed247) {
-                    channelUrls.push(line);
+                    const separator = line.includes('?') ? '&' : '?';
+                    const enrichedUrl = `${line}${separator}ch_name=${encodeURIComponent(lastChName)}&genre=${encodeURIComponent(lastGroupTitle)}`;
+                    channelUrls.push(enrichedUrl);
                 }
             }
             lastGroupTitle = "";
@@ -795,6 +874,156 @@ const server = http.createServer((req, res) => {
             cached_channels_last_active_list: Object.fromEntries(cachedChannelsMap),
             cached_segments_served_by_genre: cachedGenresMap
         }, null, 2));
+        return;
+    }
+
+    // ─── ROUTE 8: Transparent Reverse-Proxy with Automatic Segment Caching ───
+    // This allows accessing channels directly using paths like:
+    // /Nick_Ben_MOB/WDVLive/index.mpd
+    // All segments (.dash / .ts) are cached automatically on disk!
+    const cleanPath = pathname;
+    
+    if (cleanPath !== '/fav' && !cleanPath.startsWith('/fav/') && 
+        cleanPath !== '/mpd' && cleanPath !== '/index.mpd' && 
+        cleanPath !== '/dash_segment' && cleanPath !== '/segment' && 
+        cleanPath !== '/playlist.m3u' && cleanPath !== '/playlist' && 
+        cleanPath !== '/' && cleanPath !== '/info' && !cleanPath.startsWith('/stream/')) {
+        
+        const qStr = parsedUrl.search || '';
+        const upstreamUrl = `https://mini.allinonereborn.site/jtv-plus/jtv.php${cleanPath}${qStr}`;
+
+        const isMpd = cleanPath.endsWith('.mpd') || cleanPath.includes('.mpd/');
+        const isM3u8 = cleanPath.endsWith('.m3u8') || cleanPath.includes('.m3u8/');
+        const isSegment = cleanPath.endsWith('.dash') || cleanPath.endsWith('.ts') || 
+                          cleanPath.includes('.dash?') || cleanPath.includes('.ts?');
+
+        if (isMpd) {
+            fetchUrl(upstreamUrl).then((mpdRes) => {
+                if (mpdRes.statusCode !== 200) {
+                    res.writeHead(mpdRes.statusCode, { 'Content-Type': 'text/plain' });
+                    res.end(`Upstream error: ${mpdRes.statusCode}`);
+                    return;
+                }
+                
+                let mpdData = mpdRes.data.replace(/\/jtv-plus\/jtv.php\//g, '/');
+                
+                res.writeHead(200, {
+                    'Content-Type': 'application/dash+xml',
+                    'Cache-Control': 'no-cache, no-store, must-revalidate',
+                    'Access-Control-Allow-Origin': '*'
+                });
+                res.end(mpdData);
+            }).catch(err => {
+                res.writeHead(502, { 'Content-Type': 'text/plain' });
+                res.end(`Proxy failed: ${err.message}`);
+            });
+            return;
+        }
+
+        if (isM3u8) {
+            fetchUrl(upstreamUrl).then((hlsRes) => {
+                if (hlsRes.statusCode !== 200) {
+                    res.writeHead(hlsRes.statusCode, { 'Content-Type': 'text/plain' });
+                    res.end(`Upstream error: ${hlsRes.statusCode}`);
+                    return;
+                }
+
+                let hlsData = hlsRes.data.replace(/\/jtv-plus\/jtv.php\//g, '/');
+                
+                res.writeHead(200, {
+                    'Content-Type': 'application/vnd.apple.mpegurl',
+                    'Cache-Control': 'no-cache, no-store, must-revalidate',
+                    'Access-Control-Allow-Origin': '*'
+                });
+                res.end(hlsData);
+            }).catch(err => {
+                res.writeHead(502, { 'Content-Type': 'text/plain' });
+                res.end(`Proxy failed: ${err.message}`);
+            });
+            return;
+        }
+
+        if (isSegment) {
+            const urlHash = crypto.createHash('md5').update(upstreamUrl).digest('hex');
+            const ext = cleanPath.endsWith('.dash') || cleanPath.includes('.dash?') ? 'dash' : 'ts';
+            const cacheFilePath = path.join(CACHE_DIR, `${urlHash}.${ext}`);
+
+            if (fs.existsSync(cacheFilePath)) {
+                const stat = fs.statSync(cacheFilePath);
+                res.writeHead(200, {
+                    'Content-Type': ext === 'dash' ? 'video/mp4' : 'video/mp2t',
+                    'Content-Length': stat.size,
+                    'X-Cache-Status': 'HIT',
+                    'Cache-Control': 'no-cache',
+                    'Access-Control-Allow-Origin': '*'
+                });
+                fs.createReadStream(cacheFilePath).pipe(res);
+                return;
+            }
+
+            const parsedTarget = url.parse(upstreamUrl);
+            const client = parsedTarget.protocol === 'https:' ? https : http;
+            const options = {
+                hostname: parsedTarget.hostname,
+                port: parsedTarget.port,
+                path: parsedTarget.path,
+                method: 'GET',
+                headers: STREAM_HEADERS
+            };
+
+            const cReq = client.request(options, (cRes) => {
+                if (cRes.statusCode !== 200) {
+                    res.writeHead(cRes.statusCode, { 'Content-Type': 'text/plain' });
+                    res.end(`Upstream segment status: ${cRes.statusCode}`);
+                    return;
+                }
+
+                res.writeHead(200, {
+                    'Content-Type': ext === 'dash' ? 'video/mp4' : 'video/mp2t',
+                    'X-Cache-Status': 'MISS',
+                    'Cache-Control': 'no-cache',
+                    'Access-Control-Allow-Origin': '*'
+                });
+
+                const cacheWriter = fs.createWriteStream(cacheFilePath);
+                cRes.pipe(res);
+                cRes.pipe(cacheWriter);
+
+                cRes.on('end', () => cacheWriter.close());
+                cRes.on('error', () => {
+                    cacheWriter.close();
+                    fs.unlink(cacheFilePath, () => {});
+                });
+            });
+
+            cReq.on('error', (err) => {
+                res.writeHead(502, { 'Content-Type': 'text/plain' });
+                res.end(`Segment fetch failed: ${err.message}`);
+            });
+
+            cReq.end();
+            return;
+        }
+
+        const parsedTarget = url.parse(upstreamUrl);
+        const client = parsedTarget.protocol === 'https:' ? https : http;
+        const options = {
+            hostname: parsedTarget.hostname,
+            port: parsedTarget.port,
+            path: parsedTarget.path,
+            method: 'GET',
+            headers: STREAM_HEADERS
+        };
+
+        const cReq = client.request(options, (cRes) => {
+            res.writeHead(cRes.statusCode, cRes.headers);
+            cRes.pipe(res);
+        });
+        cReq.on('error', (err) => {
+            res.writeHead(502, { 'Content-Type': 'text/plain' });
+            res.end(`Proxy failed: ${err.message}`);
+        });
+        cReq.end();
         return;
     }
 
