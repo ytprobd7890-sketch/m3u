@@ -5,6 +5,8 @@ const path = require('path');
 const crypto = require('crypto');
 const url = require('url');
 const os = require('os');
+const net = require('net');
+const tls = require('tls');
 
 // ==============================================================================
 // Boss Kobir - JioTV Plus 24/7 Active Caching Proxy Server (Enterprise Edition)
@@ -282,11 +284,142 @@ function isJioDomain(targetUrl) {
            lowerUrl.includes('bpk-tv');
 }
 
+// Highly Robust Native HTTP CONNECT Tunnel for HTTPS Requests over HTTP Proxies (e.g. Tor/Privoxy)
+function fetchUrlViaConnectProxy(targetUrl, proxyUrl, headers = {}) {
+    return new Promise((resolve, reject) => {
+        try {
+            const parsedTarget = url.parse(targetUrl);
+            const parsedProxy = url.parse(proxyUrl);
+            
+            const proxyPort = parseInt(parsedProxy.port || '80');
+            const proxyHost = parsedProxy.hostname;
+
+            const targetPort = parseInt(parsedTarget.port || (parsedTarget.protocol === 'https:' ? '443' : '80'));
+            const targetHost = parsedTarget.hostname;
+
+            // 1. Establish TCP socket connection directly to the proxy server
+            const socket = net.connect(proxyPort, proxyHost, () => {
+                // 2. Negotiate an HTTP CONNECT tunnel to the target secure host on port 443
+                socket.write(`CONNECT ${targetHost}:${targetPort} HTTP/1.1\r\nHost: ${targetHost}:${targetPort}\r\n\r\n`);
+            });
+
+            let buffer = '';
+            socket.on('data', (chunk) => {
+                buffer += chunk.toString('binary');
+                if (buffer.includes('\r\n\r\n')) {
+                    const header = buffer.split('\r\n\r\n')[0];
+                    if (header.includes('200')) {
+                        // Tunnel successfully established! Handshake success.
+                        socket.removeAllListeners('data');
+                        socket.removeAllListeners('error');
+
+                        // 3. Upgrade the raw TCP socket to TLS (Secure HTTPS) using server name
+                        let secureSocket;
+                        if (parsedTarget.protocol === 'https:') {
+                            secureSocket = tls.connect({
+                                socket: socket,
+                                servername: targetHost,
+                                rejectUnauthorized: false
+                            }, () => {
+                                sendRequest();
+                            });
+                        } else {
+                            secureSocket = socket;
+                            sendRequest();
+                        }
+
+                        function sendRequest() {
+                            const reqPath = parsedTarget.path ? encodeURI(parsedTarget.path) : '/';
+                            const hostHeader = parsedTarget.port ? `${targetHost}:${parsedTarget.port}` : targetHost;
+                            
+                            let reqHeaders = {
+                                'Host': hostHeader,
+                                'Connection': 'close',
+                                ...STREAM_HEADERS,
+                                ...headers
+                            };
+
+                            let reqStr = `GET ${reqPath} HTTP/1.1\r\n`;
+                            for (const [k, v] of Object.entries(reqHeaders)) {
+                                reqStr += `${k}: ${v}\r\n`;
+                            }
+                            reqStr += '\r\n';
+
+                            secureSocket.write(reqStr);
+                        }
+
+                        let responseData = Buffer.alloc(0);
+                        secureSocket.on('data', (resChunk) => {
+                            responseData = Buffer.concat([responseData, resChunk]);
+                        });
+
+                        secureSocket.on('end', () => {
+                            try {
+                                const respStr = responseData.toString('binary');
+                                const parts = respStr.split('\r\n\r\n');
+                                const headerPart = parts[0];
+                                const bodyPart = responseData.slice(Buffer.byteLength(headerPart, 'binary') + 4);
+
+                                const statusLine = headerPart.split('\r\n')[0];
+                                const statusCode = parseInt(statusLine.split(' ')[1] || '500');
+
+                                const respHeaders = {};
+                                const headerLines = headerPart.split('\r\n').slice(1);
+                                headerLines.forEach(line => {
+                                    const hParts = line.split(': ');
+                                    if (hParts.length > 1) {
+                                        respHeaders[hParts[0].toLowerCase()] = hParts[1];
+                                    }
+                                });
+
+                                resolve({
+                                    data: bodyPart.toString('utf8'),
+                                    statusCode: statusCode,
+                                    headers: respHeaders,
+                                    finalUrl: targetUrl
+                                });
+                            } catch (parseErr) {
+                                reject(parseErr);
+                            }
+                        });
+
+                        secureSocket.on('error', reject);
+                    } else {
+                        socket.destroy();
+                        reject(new Error(`Proxy connection tunnel failed: ${header.split('\r\n')[0]}`));
+                    }
+                }
+            });
+
+            socket.on('error', reject);
+        } catch (e) {
+            reject(e);
+        }
+    });
+}
+
 // Generic HTTP/HTTPS Fetch Helper with Automatic Redirect Following (Up to 5 hops)
 function fetchUrl(targetUrl, headers = {}, redirectCount = 0) {
     if (redirectCount > 5) {
         return Promise.reject(new Error("Too many redirects"));
     }
+
+    // Determine active proxy to use - ONLY apply proxy for geo-blocked Jio domains!
+    // This ensures GitHub playlist downloads (which are not geo-blocked) bypass the proxy and load instantly!
+    let proxyToUse = "";
+    if (isJioDomain(targetUrl)) {
+        proxyToUse = INDIAN_PROXY;
+        if (INDIAN_PROXY === 'auto') {
+            proxyToUse = activeAutoProxy;
+        }
+    }
+
+    // If an Indian HTTP proxy is configured, route through our secure CONNECT tunnel!
+    if (proxyToUse) {
+        return fetchUrlViaConnectProxy(targetUrl, proxyToUse, headers);
+    }
+
+    // Direct connection (no proxy)
     return new Promise((resolve, reject) => {
         const parsed = url.parse(targetUrl);
         let client = parsed.protocol === 'https:' ? https : http;
@@ -298,38 +431,6 @@ function fetchUrl(targetUrl, headers = {}, redirectCount = 0) {
             rejectUnauthorized: false,
             headers: { ...STREAM_HEADERS, ...headers }
         };
-
-        // Determine active proxy to use - ONLY apply proxy for geo-blocked Jio domains!
-        // This ensures GitHub playlist downloads (which are not geo-blocked) bypass the proxy and load instantly!
-        let proxyToUse = "";
-        if (isJioDomain(targetUrl)) {
-            proxyToUse = INDIAN_PROXY;
-            if (INDIAN_PROXY === 'auto') {
-                proxyToUse = activeAutoProxy;
-            }
-        }
-
-        // If an Indian HTTP proxy is configured, route through it!
-        if (proxyToUse) {
-            try {
-                const proxyParsed = url.parse(proxyToUse);
-                client = proxyParsed.protocol === 'https:' ? https : http;
-                options = {
-                    hostname: proxyParsed.hostname,
-                    port: proxyParsed.port,
-                    path: encodeURI(targetUrl), // Fully url-encoded absolute path for HTTP proxy requests
-                    method: 'GET',
-                    rejectUnauthorized: false,
-                    headers: {
-                        'Host': parsed.hostname,
-                        ...STREAM_HEADERS,
-                        ...headers
-                    }
-                };
-            } catch (e) {
-                // Fallback to direct connection if proxy parsing fails
-            }
-        }
 
         const req = client.request(options, (res) => {
             // Check for redirect status codes (301, 302, 303, 307, 308)
@@ -921,37 +1022,112 @@ const server = http.createServer((req, res) => {
         return;
     }
 
-    // ─── ROUTE 4: Dynamic M3U Playlist of ONLY currently active cached channels! ───
+    // ─── ROUTE 4: Dynamic M3U Playlist Generator (On-The-Fly Corrected & Filtered!) ───
     if (pathname === '/playlist.m3u' || pathname === '/playlist') {
         const proto = ((!empty(req.headers['x-forwarded-proto']) && req.headers['x-forwarded-proto'] === 'https') || req.connection.encrypted) ? 'https' : 'http';
         const hostHeader = req.headers.host || 'localhost';
         const selfBase = `${proto}://${hostHeader}`;
 
-        let m3uLines = [];
-        m3uLines.push('#EXTM3U x-tvg-url="https://avkb.short.gy/epg.xml.gz" url-tvg="https://avkb.short.gy/epg.xml.gz"');
-        m3uLines.push('#');
-        m3uLines.push('#  JioTV Plus — 24/7 Cached Channels Playlist');
-        m3uLines.push('#  Owner    : Boss Kobir');
-        m3uLines.push(`#  Uptime   : ${formatUptime(process.uptime())}`);
-        m3uLines.push(`#  Channels : ${cachedChannelsMap.size}`);
-        m3uLines.push('#');
-        m3uLines.push('');
+        const SOURCE_M3U = "https://raw.githubusercontent.com/alex4528y/m3u/refs/heads/main/jtv.m3u";
 
-        cachedChannelsMap.forEach((val) => {
-            const isDash = val.id.includes('index.mpd') || val.id.includes('mpd');
-            const ext = isDash ? 'mpd' : 'm3u8';
-            const streamUrl = `${selfBase}/stream/ch_${val.id}.${ext}`;
-            m3uLines.push(`#EXTINF:-1 tvg-id="${val.id}" tvg-name="${val.name}" group-title="${val.genre}",${val.name}`);
-            m3uLines.push(streamUrl);
-        });
+        fetchUrl(SOURCE_M3U).then((m3uRes) => {
+            if (m3uRes.statusCode !== 200) {
+                res.writeHead(m3uRes.statusCode, { 'Content-Type': 'text/plain' });
+                res.end(`Failed to fetch master M3U: ${m3uRes.statusCode}`);
+                return;
+            }
 
-        res.writeHead(200, {
-            'Content-Type': 'application/x-mpegurl; charset=utf-8',
-            'Content-Disposition': 'inline; filename="JioTV_Plus_Cached_KobirTV.m3u"',
-            'Cache-Control': 'no-cache, no-store, must-revalidate',
-            'Access-Control-Allow-Origin': '*'
+            const lines = m3uRes.data.split('\n');
+            const BANNED_GENRES = ["Shopping", "Educational", "Business News", "Lifestyle", "Devotional", "News"];
+            
+            let m3uLines = [];
+            m3uLines.push('#EXTM3U x-tvg-url="https://avkb.short.gy/epg.xml.gz" url-tvg="https://avkb.short.gy/epg.xml.gz"');
+            m3uLines.push('#');
+            m3uLines.push('#  JioTV Plus — On-The-Fly Corrected & Filtered Playlist');
+            m3uLines.push('#  Owner    : Boss Kobir');
+            m3uLines.push(`#  Uptime   : ${formatUptime(process.uptime())}`);
+            m3uLines.push('#');
+            m3uLines.push('');
+
+            let currentProps = [];
+            let lastGroupTitle = "";
+            let lastChName = "";
+
+            for (let i = 0; i < lines.length; i++) {
+                let line = lines[i].trim();
+                if (!line) continue;
+
+                if (line.startsWith('#EXTM3U')) continue;
+
+                if (line.startsWith('#KODIPROP') || line.startsWith('#EXTVLCOPT') || line.startsWith('#EXTHTTP')) {
+                    currentProps.push(line);
+                    continue;
+                }
+
+                if (line.startsWith('#EXTINF:')) {
+                    const match = line.match(/group-title="([^"]+)"/);
+                    if (match) {
+                        lastGroupTitle = match[1].trim();
+                    } else {
+                        lastGroupTitle = "";
+                    }
+                    const nameParts = line.split(',');
+                    lastChName = nameParts[nameParts.length - 1].trim();
+                    currentProps.push(line);
+                    continue;
+                }
+
+                if (line.startsWith('http')) {
+                    const isBanned = BANNED_GENRES.some(genre => lastGroupTitle.toLowerCase() === genre.toLowerCase());
+                    if (!isBanned) {
+                        // Extract channel path
+                        const parsedCdn = url.parse(line);
+                        let pathPart = parsedCdn.pathname || '';
+                        if (pathPart.startsWith('/bpk-tv/')) {
+                            pathPart = pathPart.substring(7); // Remove '/bpk-tv'
+                        }
+
+                        const streamUrl = `${selfBase}${pathPart}${parsedCdn.search || ''}`;
+
+                        // Emit channel block
+                        currentProps.forEach(prop => {
+                            // Clean old User-Agent or cookie properties to keep M3U light-weight!
+                            if (!prop.startsWith('#EXTVLCOPT') && !prop.startsWith('#EXTHTTP')) {
+                                m3uLines.push(prop);
+                            }
+                        });
+
+                        // Standard headers for InputStream Adaptive
+                        const hdrs = `User-Agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 @alex_vault&Referer=https://jtvxweb.pages.dev/&Origin=https://jtvxweb.pages.dev`;
+                        m3uLines.push(`#KODIPROP:inputstream.adaptive.manifest_headers=${hdrs}`);
+                        m3uLines.push(`#KODIPROP:inputstream.adaptive.stream_headers=${hdrs}`);
+                        if (pathPart.endsWith('.mpd') || pathPart.includes('.mpd/')) {
+                            m3uLines.push("#KODIPROP:inputstream.adaptive.manifest_type=mpd");
+                        }
+
+                        m3uLines.push(streamUrl);
+                        m3uLines.push('');
+                    }
+
+                    // Reset for next channel
+                    currentProps = [];
+                    lastGroupTitle = "";
+                    lastChName = "";
+                }
+            }
+
+            res.writeHead(200, {
+                'Content-Type': 'application/x-mpegurl; charset=utf-8',
+                'Content-Disposition': 'inline; filename="JioTV_Plus_Corrected_KobirTV.m3u"',
+                'Cache-Control': 'no-cache, no-store, must-revalidate',
+                'Access-Control-Allow-Origin': '*'
+            });
+            res.end(m3uLines.join('\n'));
+
+        }).catch(err => {
+            res.writeHead(502, { 'Content-Type': 'text/plain' });
+            res.end(`Failed to build playlist: ${err.message}`);
         });
-        res.end(m3uLines.join('\n'));
         return;
     }
 
@@ -1253,3 +1429,5 @@ const server = http.createServer((req, res) => {
 server.listen(PORT, () => {
     console.log(`🚀 Boss Kobir's Pro 24/7 Active Dual-Protocol JioTV Plus Cache Node listening on Port ${PORT}`);
 });
+
+
