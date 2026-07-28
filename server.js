@@ -618,10 +618,23 @@ const server = http.createServer((req, res) => {
             });
 
             const cacheWriter = fs.createWriteStream(cacheFilePath);
+            const expectedLength = parseInt(cRes.headers['content-length'] || '0');
+            let downloadedBytes = 0;
+
+            cRes.on('data', (chunk) => {
+                downloadedBytes += chunk.length;
+            });
+
             cRes.pipe(res);
             cRes.pipe(cacheWriter);
 
-            cRes.on('end', () => cacheWriter.close());
+            cRes.on('end', () => {
+                cacheWriter.close();
+                if (expectedLength > 0 && downloadedBytes < expectedLength) {
+                    fs.unlink(cacheFilePath, () => {});
+                    console.error(`[Cache Error] Deleted incomplete DASH segment: downloaded ${downloadedBytes}/${expectedLength} bytes.`);
+                }
+            });
             cRes.on('error', () => {
                 cacheWriter.close();
                 fs.unlink(cacheFilePath, () => {});
@@ -696,10 +709,23 @@ const server = http.createServer((req, res) => {
             });
 
             const cacheWriter = fs.createWriteStream(cacheFilePath);
+            const expectedLength = parseInt(cRes.headers['content-length'] || '0');
+            let downloadedBytes = 0;
+
+            cRes.on('data', (chunk) => {
+                downloadedBytes += chunk.length;
+            });
+
             cRes.pipe(res);
             cRes.pipe(cacheWriter);
 
-            cRes.on('end', () => cacheWriter.close());
+            cRes.on('end', () => {
+                cacheWriter.close();
+                if (expectedLength > 0 && downloadedBytes < expectedLength) {
+                    fs.unlink(cacheFilePath, () => {});
+                    console.error(`[Cache Error] Deleted incomplete HLS segment: downloaded ${downloadedBytes}/${expectedLength} bytes.`);
+                }
+            });
             cRes.on('error', () => {
                 cacheWriter.close();
                 fs.unlink(cacheFilePath, () => {});
@@ -986,10 +1012,23 @@ const server = http.createServer((req, res) => {
                 });
 
                 const cacheWriter = fs.createWriteStream(cacheFilePath);
+                const expectedLength = parseInt(cRes.headers['content-length'] || '0');
+                let downloadedBytes = 0;
+
+                cRes.on('data', (chunk) => {
+                    downloadedBytes += chunk.length;
+                });
+
                 cRes.pipe(res);
                 cRes.pipe(cacheWriter);
 
-                cRes.on('end', () => cacheWriter.close());
+                cRes.on('end', () => {
+                    cacheWriter.close();
+                    if (expectedLength > 0 && downloadedBytes < expectedLength) {
+                        fs.unlink(cacheFilePath, () => {});
+                        console.error(`[Cache Error] Deleted incomplete Proxy segment: downloaded ${downloadedBytes}/${expectedLength} bytes.`);
+                    }
+                });
                 cRes.on('error', () => {
                     cacheWriter.close();
                     fs.unlink(cacheFilePath, () => {});
