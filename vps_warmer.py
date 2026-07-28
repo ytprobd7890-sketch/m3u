@@ -14,7 +14,7 @@ from concurrent.futures import ThreadPoolExecutor
 # Configuration (JioTV Plus Dedicated Playlist)
 RAILWAY_PLAYLIST_URL = os.environ.get(
     "RAILWAY_PLAYLIST_URL", 
-    "https://raw.githubusercontent.com/ytprobd7890-sketch/m3u/refs/heads/main/output/jtvplusww.m3u"
+    "https://github.com/ytprobd7890-sketch/m3u/raw/refs/heads/main/output/jtvplusww.m3u"
 )
 MAX_CONCURRENT_THREADS = int(os.environ.get("MAX_CONCURRENT_THREADS", "50"))
 CHANNEL_WARM_TIMEOUT = int(os.environ.get("CHANNEL_WARM_TIMEOUT", "3"))
@@ -30,12 +30,24 @@ def get_channels_list():
         
         lines = r.text.split("\n")
         stream_urls = []
+        banned_genres = ["shopping", "educational", "business news", "lifestyle", "devotional", "news"]
+        
+        import re
+        last_group_title = ""
         for line in lines:
             line = line.strip()
-            if line and line.startswith("http"):
-                stream_urls.append(line)
+            if line.startswith("#EXTINF:"):
+                match = re.search(r'group-title="([^"]+)"', line)
+                if match:
+                    last_group_title = match.group(1).strip().lower()
+                else:
+                    last_group_title = ""
+            elif line.startswith("http"):
+                if last_group_title not in banned_genres:
+                    stream_urls.append(line)
+                last_group_title = ""
         
-        print(f"[JioTV+ Cacher] Successfully indexed {len(stream_urls)} channels for proactive 24/7 caching!")
+        print(f"[JioTV+ Cacher] Successfully indexed {len(stream_urls)} channels for proactive 24/7 caching! (Excluded Shopping, Educational, Business News, Lifestyle, Devotional, News)")
         return stream_urls
     except Exception as e:
         print(f"[Error] Failed to read playlist: {e}")
