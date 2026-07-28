@@ -236,14 +236,20 @@ function downloadSegmentToCache(segUrl, cacheFilePath) {
 
 // Active 24/7 Channel Segment Harvester Worker (Fully parses DASH MPD & HLS M3U8!)
 async function harvestChannelSegment(channelUrl) {
+    let chName = 'Unknown';
     try {
         const parsedUrl = url.parse(channelUrl, true);
-        const chName = parsedUrl.query.ch_name || 'Unknown';
+        chName = parsedUrl.query.ch_name || 'Unknown';
         const genre = parsedUrl.query.genre || 'General';
+
+        console.log(`[Harvester Worker] [${chName}] Starting harvest from: ${channelUrl}`);
 
         // Fetch the channel's manifest (M3U8 or MPD)
         const m3u8Res = await fetchUrl(channelUrl);
-        if (m3u8Res.statusCode !== 200) return;
+        if (m3u8Res.statusCode !== 200) {
+            console.error(`[Harvester Worker] [${chName}] Failed to fetch manifest. HTTP Status: ${m3u8Res.statusCode}`);
+            return;
+        }
 
         const isDash = channelUrl.endsWith('.mpd') || channelUrl.includes('.mpd?');
         const segmentUrls = [];
@@ -298,6 +304,7 @@ async function harvestChannelSegment(channelUrl) {
 
                 // Pre-warm the last 2 media segments of the active timeline
                 const timesToCache = computedTimes.slice(-2);
+                console.log(`[Harvester Worker] [${chName}] Found ${computedTimes.length} total segments, pre-warming last ${timesToCache.length} segments.`);
                 
                 if (initMatch) {
                     const absInitTemplate = getAbsPath(initMatch[1]);
@@ -307,6 +314,8 @@ async function harvestChannelSegment(channelUrl) {
                 timesToCache.forEach(time => {
                     segmentUrls.push(absMediaTemplate.replace('$RepresentationID$', repId).replace('$Time$', time));
                 });
+            } else {
+                console.warn(`[Harvester Worker] [${chName}] Could not find media template in DASH XML manifest.`);
             }
         } else {
             // --- Parse HLS M3U8 ---
@@ -327,6 +336,12 @@ async function harvestChannelSegment(channelUrl) {
                     break; // Just cache the first active HLS segment
                 }
             }
+            console.log(`[Harvester Worker] [${chName}] Parsed HLS manifest, found ${segmentUrls.length} segment to cache.`);
+        }
+
+        if (segmentUrls.length === 0) {
+            console.warn(`[Harvester Worker] [${chName}] No segments extracted from manifest.`);
+            return;
         }
 
         // --- Fetch and cache the extracted segments ---
@@ -336,6 +351,7 @@ async function harvestChannelSegment(channelUrl) {
             const cacheFilePath = path.join(CACHE_DIR, `${urlHash}.${ext}`);
 
             if (fs.existsSync(cacheFilePath)) {
+                console.log(`[Harvester Worker] [${chName}] Segment already in cache: ${urlHash}.${ext}`);
                 // Already cached! Just update stats in memory
                 cachedChannelsMap.set(chName, {
                     id: parsedUrl.pathname.replace('/jtv-plus/jtv.php/', ''),
@@ -348,7 +364,9 @@ async function harvestChannelSegment(channelUrl) {
             }
 
             try {
+                console.log(`[Harvester Worker] [${chName}] Downloading segment to cache: ${segUrl}`);
                 await downloadSegmentToCache(segUrl, cacheFilePath);
+                console.log(`[Harvester Worker] [${chName}] Successfully cached segment: ${urlHash}.${ext}`);
                 cachedChannelsMap.set(chName, {
                     id: parsedUrl.pathname.replace('/jtv-plus/jtv.php/', ''),
                     name: chName,
@@ -359,12 +377,12 @@ async function harvestChannelSegment(channelUrl) {
                 if (!cachedGenresMap[genre]) cachedGenresMap[genre] = 0;
                 cachedGenresMap[genre]++;
             } catch (err) {
-                // Fail silently
+                console.error(`[Harvester Worker] [${chName}] Failed to download segment to cache. Error: ${err.message}`);
             }
         }
 
     } catch (e) {
-        // Fail silently
+        console.error(`[Harvester Worker Exception] [${chName}] Failed inside harvestChannelSegment. Error: ${e.message}`);
     }
 }
 
