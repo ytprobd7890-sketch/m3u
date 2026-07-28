@@ -110,7 +110,7 @@ function smartAutoCleanSegments() {
 setInterval(smartAutoCleanSegments, 10000);
 
 // Configuration (JioTV Plus Dedicated Playlist)
-const RAILWAY_PLAYLIST_URL = process.env.RAILWAY_PLAYLIST_URL || "https://raw.githubusercontent.com/alex4528y/m3u/refs/heads/main/jtv.m3u";
+const RAILWAY_PLAYLIST_URL = process.env.RAILWAY_PLAYLIST_URL || "https://github.com/ytprobd7890-sketch/m3u/raw/refs/heads/main/output/jtvplusww.m3u";
 const MAX_CONCURRENT_HARVESTERS = parseInt(process.env.MAX_CONCURRENT_HARVESTERS || "40"); 
 
 // Telemetry Analytics
@@ -272,6 +272,16 @@ function huntActiveAutoProxy() {
 setInterval(huntActiveAutoProxy, 1800000);
 setTimeout(huntActiveAutoProxy, 1000);
 
+// Helper to identify if a URL points to Jio TV CDN or aggregator proxy
+function isJioDomain(targetUrl) {
+    const lowerUrl = targetUrl.toLowerCase();
+    return lowerUrl.includes('jiotv') || 
+           lowerUrl.includes('jio.com') || 
+           lowerUrl.includes('allinonereborn') ||
+           lowerUrl.includes('/jtv-plus/') ||
+           lowerUrl.includes('bpk-tv');
+}
+
 // Generic HTTP/HTTPS Fetch Helper with Automatic Redirect Following (Up to 5 hops)
 function fetchUrl(targetUrl, headers = {}, redirectCount = 0) {
     if (redirectCount > 5) {
@@ -289,10 +299,14 @@ function fetchUrl(targetUrl, headers = {}, redirectCount = 0) {
             headers: { ...STREAM_HEADERS, ...headers }
         };
 
-        // Determine active proxy to use
-        let proxyToUse = INDIAN_PROXY;
-        if (INDIAN_PROXY === 'auto') {
-            proxyToUse = activeAutoProxy;
+        // Determine active proxy to use - ONLY apply proxy for geo-blocked Jio domains!
+        // This ensures GitHub playlist downloads (which are not geo-blocked) bypass the proxy and load instantly!
+        let proxyToUse = "";
+        if (isJioDomain(targetUrl)) {
+            proxyToUse = INDIAN_PROXY;
+            if (INDIAN_PROXY === 'auto') {
+                proxyToUse = activeAutoProxy;
+            }
         }
 
         // If an Indian HTTP proxy is configured, route through it!
