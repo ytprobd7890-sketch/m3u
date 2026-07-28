@@ -110,7 +110,7 @@ function smartAutoCleanSegments() {
 setInterval(smartAutoCleanSegments, 10000);
 
 // Configuration (JioTV Plus Dedicated Playlist)
-const RAILWAY_PLAYLIST_URL = process.env.RAILWAY_PLAYLIST_URL || "https://github.com/ytprobd7890-sketch/m3u/raw/refs/heads/main/output/jtvplusww.m3u";
+const RAILWAY_PLAYLIST_URL = process.env.RAILWAY_PLAYLIST_URL || "https://raw.githubusercontent.com/alex4528y/m3u/refs/heads/main/jtv.m3u";
 const MAX_CONCURRENT_HARVESTERS = parseInt(process.env.MAX_CONCURRENT_HARVESTERS || "40"); 
 
 // Telemetry Analytics
