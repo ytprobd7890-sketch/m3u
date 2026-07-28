@@ -18,7 +18,7 @@ const PORT = process.env.PORT || 8080;
 const CACHE_DIR = path.join(__dirname, 'cache_segments');
 
 // Configuration (JioTV Plus Dedicated Playlist)
-const RAILWAY_PLAYLIST_URL = process.env.RAILWAY_PLAYLIST_URL || "https://github.com/ytprobd7890-sketch/m3u/raw/refs/heads/main/output/worldwide.m3u";
+const RAILWAY_PLAYLIST_URL = process.env.RAILWAY_PLAYLIST_URL || "https://github.com/ytprobd7890-sketch/m3u/raw/refs/heads/main/output/jtvplusww.m3u";
 const MAX_CONCURRENT_HARVESTERS = parseInt(process.env.MAX_CONCURRENT_HARVESTERS || "40"); 
 
 // Telemetry Analytics
@@ -69,8 +69,11 @@ const STREAM_HEADERS = {
     'sec-fetch-site': 'cross-site'
 };
 
-// Generic HTTP/HTTPS Fetch Helper
-function fetchUrl(targetUrl, headers = {}) {
+// Generic HTTP/HTTPS Fetch Helper with Automatic Redirect Following (Up to 5 hops)
+function fetchUrl(targetUrl, headers = {}, redirectCount = 0) {
+    if (redirectCount > 5) {
+        return Promise.reject(new Error("Too many redirects"));
+    }
     return new Promise((resolve, reject) => {
         const parsed = url.parse(targetUrl);
         const client = parsed.protocol === 'https:' ? https : http;
@@ -82,11 +85,24 @@ function fetchUrl(targetUrl, headers = {}) {
             rejectUnauthorized: false,
             headers: { ...STREAM_HEADERS, ...headers }
         };
-        client.request(options, (res) => {
+        const req = client.request(options, (res) => {
+            // Check for redirect status codes (301, 302, 303, 307, 308)
+            if ([301, 302, 303, 307, 308].includes(res.statusCode) && res.headers.location) {
+                let redirectUrl = res.headers.location;
+                if (!redirectUrl.startsWith('http')) {
+                    const parsedOriginal = url.parse(targetUrl);
+                    redirectUrl = `${parsedOriginal.protocol}//${parsedOriginal.host}${redirectUrl.startsWith('/') ? '' : '/'}${redirectUrl}`;
+                }
+                resolve(fetchUrl(redirectUrl, headers, redirectCount + 1));
+                return;
+            }
+
             let data = '';
             res.on('data', chunk => data += chunk);
-            res.on('end', () => resolve({ data, statusCode: res.statusCode, headers: res.headers }));
-        }).on('error', reject).end();
+            res.on('end', () => resolve({ data, statusCode: res.statusCode, headers: res.headers, finalUrl: targetUrl }));
+        });
+        req.on('error', reject);
+        req.end();
     });
 }
 
@@ -203,14 +219,28 @@ async function runActiveHarvesterLoop() {
 
     const lines = m3uRes.data.split('\n');
     const channelUrls = [];
-    for (let line of lines) {
-        line = line.trim();
-        if (line && line.startsWith('http')) {
-            channelUrls.push(line);
+    const BANNED_GENRES = ["Shopping", "Educational", "Business News", "Lifestyle", "Devotional", "News"];
+
+    let lastGroupTitle = "";
+    for (let i = 0; i < lines.length; i++) {
+        let line = lines[i].trim();
+        if (line.startsWith('#EXTINF:')) {
+            const match = line.match(/group-title="([^"]+)"/);
+            if (match) {
+                lastGroupTitle = match[1].trim();
+            } else {
+                lastGroupTitle = "";
+            }
+        } else if (line.startsWith('http')) {
+            const isBanned = BANNED_GENRES.some(genre => lastGroupTitle.toLowerCase() === genre.toLowerCase());
+            if (!isBanned) {
+                channelUrls.push(line);
+            }
+            lastGroupTitle = "";
         }
     }
 
-    console.log(`[Harvester] Successfully indexed ${channelUrls.length} channels. Starting parallel 24/7 harvesting cycle...`);
+    console.log(`[Harvester] Successfully indexed ${channelUrls.length} channels (excluding Shopping, Educational, Business News, Lifestyle, Devotional, News). Starting parallel 24/7 harvesting cycle...`);
 
     let index = 0;
     async function worker() {
@@ -295,26 +325,14 @@ const server = http.createServer((req, res) => {
 
         // Fetch the original MPD XML from the secure source
         fetchUrl(targetMpdUrl).then((mpdRes) => {
-            if (mpdRes.statusCode !== 200 && mpdRes.statusCode !== 302 && mpdRes.statusCode !== 301) {
+            if (mpdRes.statusCode !== 200) {
                 res.writeHead(mpdRes.statusCode, { 'Content-Type': 'text/plain' });
                 res.end(`Source responded with error status: ${mpdRes.statusCode}`);
                 return;
             }
 
             let mpdData = mpdRes.data;
-            
-            // If the source redirected, follow it and download the XML
-            if (mpdRes.statusCode === 301 || mpdRes.statusCode === 302) {
-                const redirectMpd = mpdRes.headers.location;
-                fetchUrl(redirectMpd).then((secondRes) => {
-                    serveAndRewriteMpd(secondRes.data, redirectMpd, res);
-                }).catch(err => {
-                    res.writeHead(502, { 'Content-Type': 'text/plain' });
-                    res.end(`Failed to fetch redirected MPD: ${err.message}`);
-                });
-            } else {
-                serveAndRewriteMpd(mpdData, targetMpdUrl, res);
-            }
+            serveAndRewriteMpd(mpdData, mpdRes.finalUrl || targetMpdUrl, res);
         }).catch(err => {
             res.writeHead(502, { 'Content-Type': 'text/plain' });
             res.end(`Failed to fetch MPD: ${err.message}`);
