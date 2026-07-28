@@ -16,6 +16,98 @@ const os = require('os');
 
 const PORT = process.env.PORT || 8080;
 const CACHE_DIR = path.join(__dirname, 'cache_segments');
+const ALLOWED_247_FILE = path.join(__dirname, 'allowed_247_channels.json');
+
+function loadAllowed247Channels() {
+    let allowed = ["Nick Bangla", "ABP Ananda", "Colors Cineplex Bollywood"]; // Defaults
+    
+    // Try loading from file
+    if (fs.existsSync(ALLOWED_247_FILE)) {
+        try {
+            const fileData = fs.readFileSync(ALLOWED_247_FILE, 'utf8');
+            allowed = JSON.parse(fileData);
+        } catch (e) {
+            // Fallback
+        }
+    } else {
+        // Create default file
+        try {
+            fs.writeFileSync(ALLOWED_247_FILE, JSON.stringify(allowed, null, 2), 'utf8');
+        } catch (e) {}
+    }
+
+    // Merge with environment variable if present
+    if (process.env.ALLOWED_247_CHANNELS) {
+        const envChannels = process.env.ALLOWED_247_CHANNELS.split(',').map(c => c.trim()).filter(Boolean);
+        if (envChannels.length > 0) {
+            allowed = envChannels;
+        }
+    }
+
+    return allowed;
+}
+
+// Smart Cache Eviction Configuration (Prevents disk filling & memory clogging)
+const MAX_CACHE_FILES = parseInt(process.env.MAX_CACHE_FILES || "300"); // Max files allowed on disk
+const MAX_CACHE_AGE_MS = parseInt(process.env.MAX_CACHE_AGE_MS || "180000"); // 3 minutes max segment age
+
+function smartAutoCleanSegments() {
+    try {
+        if (!fs.existsSync(CACHE_DIR)) return;
+
+        const files = fs.readdirSync(CACHE_DIR);
+        const now = Date.now();
+        const fileDetails = [];
+
+        files.forEach(file => {
+            const filePath = path.join(CACHE_DIR, file);
+            try {
+                const stats = fs.statSync(filePath);
+                fileDetails.push({ name: file, path: filePath, mtime: stats.mtimeMs, size: stats.size });
+            } catch (e) {
+                // Ignore transient locked files
+            }
+        });
+
+        // 1. Evict based on age (older than 3 minutes)
+        let deletedByAge = 0;
+        const activeFiles = [];
+
+        fileDetails.forEach(file => {
+            if (now - file.mtime > MAX_CACHE_AGE_MS) {
+                try {
+                    fs.unlinkSync(file.path);
+                    deletedByAge++;
+                } catch (e) {}
+            } else {
+                activeFiles.push(file);
+            }
+        });
+
+        // 2. Evict based on capacity (delete oldest files first)
+        let deletedByCapacity = 0;
+        if (activeFiles.length > MAX_CACHE_FILES) {
+            activeFiles.sort((a, b) => a.mtime - b.mtime); // Oldest first
+            
+            const toDeleteCount = activeFiles.length - MAX_CACHE_FILES;
+            for (let i = 0; i < toDeleteCount; i++) {
+                try {
+                    fs.unlinkSync(activeFiles[i].path);
+                    deletedByCapacity++;
+                } catch (e) {}
+            }
+        }
+
+        if (deletedByAge > 0 || deletedByCapacity > 0) {
+            console.log(`[Smart Cleaner] Evicted ${deletedByAge} expired segments and ${deletedByCapacity} over-capacity segments. Active segments on disk: ${fs.readdirSync(CACHE_DIR).length}`);
+        }
+    } catch (err) {
+        console.error("[Smart Cleaner Error] Eviction cycle failed:", err.message);
+    }
+}
+
+// Run Smart Auto-Cleaner as a standalone high-priority timer every 10 seconds!
+setInterval(smartAutoCleanSegments, 10000);
 
 // Configuration (JioTV Plus Dedicated Playlist)
 const RAILWAY_PLAYLIST_URL = process.env.RAILWAY_PLAYLIST_URL || "https://github.com/ytprobd7890-sketch/m3u/raw/refs/heads/main/output/jtvplusww.m3u";
@@ -220,8 +312,10 @@ async function runActiveHarvesterLoop() {
     const lines = m3uRes.data.split('\n');
     const channelUrls = [];
     const BANNED_GENRES = ["Shopping", "Educational", "Business News", "Lifestyle", "Devotional", "News"];
+    const ALLOWED_247 = loadAllowed247Channels();
 
     let lastGroupTitle = "";
+    let lastChName = "";
     for (let i = 0; i < lines.length; i++) {
         let line = lines[i].trim();
         if (line.startsWith('#EXTINF:')) {
@@ -231,16 +325,22 @@ async function runActiveHarvesterLoop() {
             } else {
                 lastGroupTitle = "";
             }
+            const nameParts = line.split(',');
+            lastChName = nameParts[nameParts.length - 1].trim();
         } else if (line.startsWith('http')) {
             const isBanned = BANNED_GENRES.some(genre => lastGroupTitle.toLowerCase() === genre.toLowerCase());
             if (!isBanned) {
-                channelUrls.push(line);
+                const isAllowed247 = ALLOWED_247.some(allowedName => lastChName.toLowerCase().includes(allowedName.toLowerCase()));
+                if (isAllowed247) {
+                    channelUrls.push(line);
+                }
             }
             lastGroupTitle = "";
+            lastChName = "";
         }
     }
 
-    console.log(`[Harvester] Successfully indexed ${channelUrls.length} channels (excluding Shopping, Educational, Business News, Lifestyle, Devotional, News). Starting parallel 24/7 harvesting cycle...`);
+    console.log(`[Harvester] Successfully indexed ${channelUrls.length} favorite channels for active 24/7 pre-caching. Starting parallel cycle...`);
 
     let index = 0;
     async function worker() {
@@ -259,18 +359,8 @@ async function runActiveHarvesterLoop() {
 
     console.log(`[Harvester] Completed 1 full active 24/7 harvesting cycle. Starting next cycle in 2 seconds...`);
     
-    // Auto-clean segments older than 5 minutes to prevent clogging up disk
-    try {
-        const files = fs.readdirSync(CACHE_DIR);
-        const now = Date.now();
-        files.forEach(file => {
-            const filePath = path.join(CACHE_DIR, file);
-            const stats = fs.statSync(filePath);
-            if (now - stats.mtimeMs > 300000) { // 5 minutes
-                fs.unlinkSync(filePath);
-            }
-        });
-    } catch (e) {}
+    // Auto-clean old chunk segments with smart LRU eviction
+    smartAutoCleanSegments();
 
     // Auto-clean channels from memory list if not active for 10 minutes
     const now = Date.now();
@@ -618,6 +708,47 @@ const server = http.createServer((req, res) => {
         return;
     }
 
+    // ─── ROUTE 7: Manage Allowed 24/7 Pre-Cached Favorite Channels ───
+    if (pathname === '/fav' || pathname === '/fav/add' || pathname === '/fav/remove') {
+        const allowed = loadAllowed247Channels();
+        
+        if (pathname === '/fav/add') {
+            const addName = parsedUrl.query.name;
+            if (addName) {
+                const trimmedName = addName.trim();
+                if (!allowed.some(c => c.toLowerCase() === trimmedName.toLowerCase())) {
+                    allowed.push(trimmedName);
+                    try {
+                        fs.writeFileSync(ALLOWED_247_FILE, JSON.stringify(allowed, null, 2), 'utf8');
+                    } catch (e) {}
+                }
+            }
+        } else if (pathname === '/fav/remove') {
+            const removeName = parsedUrl.query.name;
+            if (removeName) {
+                const trimmedName = removeName.trim();
+                const filtered = allowed.filter(c => c.toLowerCase() !== trimmedName.toLowerCase());
+                try {
+                    fs.writeFileSync(ALLOWED_247_FILE, JSON.stringify(filtered, null, 2), 'utf8');
+                } catch (e) {}
+            }
+        }
+
+        // Return updated list
+        const currentList = fs.existsSync(ALLOWED_247_FILE) ? JSON.parse(fs.readFileSync(ALLOWED_247_FILE, 'utf8')) : allowed;
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+            status: "success",
+            allowed_247_channels_count: currentList.length,
+            allowed_247_channels_list: currentList,
+            instructions: {
+                add_favorite: "/fav/add?name=CHANNEL_NAME",
+                remove_favorite: "/fav/remove?name=CHANNEL_NAME"
+            }
+        }, null, 2));
+        return;
+    }
+
     // ─── ROUTE 6: Real-time 24/7 Telemetry Dashboard ───
     if (pathname === '/' || pathname === '/info') {
         let cachedFilesCount = 0;
@@ -637,6 +768,8 @@ const server = http.createServer((req, res) => {
             version: "4.5.0-JioTVPlusEdition",
             owner: "Boss Kobir",
             caching_mode: "AUTOMATED_24_7_ACTIVE_PULL (No-VPS Required)",
+            allowed_247_channels_count: loadAllowed247Channels().length,
+            allowed_247_channels_list: loadAllowed247Channels(),
             supported_protocols: ["HLS (.m3u8/.ts)", "MPEG-DASH (.mpd/.dash)"],
             
             // Telemetry Analytics
