@@ -1,0 +1,33 @@
+name: "JioTV Plus 24/7 Auto-Update Playlist"
+
+on:
+  schedule:
+    - cron: "0 * * * *" # Runs automatically every 1 hour!
+  workflow_dispatch: # Allows manual trigger from GitHub UI!
+
+jobs:
+  update-playlist:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run Converter Script
+        run: python convert_json.py
+        env:
+          SERVER_URL: "https://m3u-production.up.railway.app"
+
+      - name: Commit and Push changes
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add output/jtvplusww.m3u
+          git diff --quiet && git diff --staged --quiet || (git commit -m "chore(playlist): 24/7 auto-refresh jtvplusww.m3u ($(date -u +'%Y-%m-%d %H:%M UTC'))" && git push)
