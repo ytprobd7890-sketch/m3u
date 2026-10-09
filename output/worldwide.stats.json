@@ -1,10 +1,10 @@
 {
-  "generated_at": 1790824287,
-  "generated_at_iso": "2026-10-01T03:11:27Z",
+  "generated_at": 1791529156,
+  "generated_at_iso": "2026-10-09T06:59:16Z",
   "source": "https://alex4528.site/playlist/jstar.m3u",
   "proxy": "https://mini.allinonereborn.site/jtv-plus/jtv.php",
-  "total_channels": 1293,
-  "converted": 1286,
-  "passed_through": 7,
+  "total_channels": 1084,
+  "converted": 0,
+  "passed_through": 1084,
   "skipped": 0
 }
